@@ -87,7 +87,7 @@
  *
  * == Key ==
  *  + Normal node
- *  * Marked node, representing a key and it's values.
+ *  * Marked node, representing a key and its values.
  *
  * +
  * |-a-+-s-+-k-*
