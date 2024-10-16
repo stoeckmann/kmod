@@ -130,8 +130,12 @@ static inline uint64_t elf_get_uint_unchecked(const struct kmod_elf *elf, uint64
 		for (i = 0; i < size; i++)
 			ret = (ret << 8) | p[i];
 	} else {
+#if __BYTE_ORDER == __ORDER_LITTLE_ENDIAN__
+		memcpy(&ret, p, size);
+#else
 		for (i = 1; i <= size; i++)
 			ret = (ret << 8) | p[size - i];
+#endif
 	}
 
 	ELFDBG(elf, "size=%" PRIu16 " offset=%" PRIu64 " value=%" PRIu64 "\n", size,
