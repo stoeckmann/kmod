@@ -278,7 +278,7 @@ static inline int elf_get_section_info(const struct kmod_elf *elf, uint16_t idx,
 static const char *elf_get_strings_section(const struct kmod_elf *elf, uint64_t *size)
 {
 	*size = elf->header.strings.size;
-	return elf_get_mem(elf, elf->header.strings.offset);
+	return (const char *)(elf->memory + elf->header.strings.offset);
 }
 
 struct kmod_elf *kmod_elf_new(const void *memory, off_t size)
