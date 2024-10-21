@@ -907,20 +907,15 @@ static char *index_mm_search_node(struct index_mm_node *node, const char *key)
 {
 	char *value;
 	struct index_mm_node *child;
-	int ch;
-	int j;
 
 	while (node) {
-		for (j = 0; node->prefix[j]; j++) {
-			ch = node->prefix[j];
-
-			if (ch != key[j]) {
-				index_mm_free_node(node);
-				return NULL;
-			}
+		size_t len = strlen(node->prefix);
+		if (strncmp(key, node->prefix, len)) {
+			index_mm_free_node(node);
+			return NULL;
 		}
 
-		key += j;
+		key += len;
 
 		if (*key == '\0') {
 			value = node->values.len > 0 ?
