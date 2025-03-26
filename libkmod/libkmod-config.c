@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include <shared/strbuf.h>
 #include <shared/util.h>
 
 #include "libkmod.h"
@@ -234,19 +235,21 @@ static int kmod_config_add_blacklist(struct kmod_config *config, const char *mod
 static int kmod_config_add_softdep(struct kmod_config *config, const char *modname,
 				   const char *line)
 {
+	DECLARE_STRBUF_WITH_STACK(sbuf_pre, 512);
+	DECLARE_STRBUF_WITH_STACK(sbuf_post, 512);
 	struct kmod_list *list;
 	struct kmod_softdep *dep;
 	const char *s, *p;
 	char *itr;
 	unsigned int n_pre = 0, n_post = 0;
 	size_t modnamelen = strlen(modname) + 1;
-	size_t buflen = 0, size, size_pre, size_post;
+	size_t size, size_pre, size_post;
 	bool was_space = false;
 	enum { S_NONE, S_PRE, S_POST } mode = S_NONE;
 
 	DBG(config->ctx, "modname=%s\n", modname);
 
-	/* analyze and count */
+	/* fill string buffers and count */
 	for (p = s = line;; s++) {
 		size_t plen;
 
@@ -274,21 +277,29 @@ static int kmod_config_add_softdep(struct kmod_config *config, const char *modna
 			 memcmp(p, "post:", sizeof("post:") - 1) == 0)
 			mode = S_POST;
 		else if (*s != '\0' || (*s == '\0' && !was_space)) {
+			unsigned int *counter;
+			struct strbuf *sbuf;
+
 			if (mode == S_PRE) {
-				buflen += plen + 1;
-				if (uadd32_overflow(n_pre, 1, &n_pre)) {
+				counter = &n_pre;
+				sbuf = &sbuf_pre;
+			} else if (mode == S_POST) {
+				counter = &n_post;
+				sbuf = &sbuf_pre;
+			}
+
+			if (mode == S_PRE || mode == S_POST) {
+				if (uadd32_overflow(*counter, 1, counter)) {
 					ERR(config->ctx,
-					    "too many pre softdeps for modname=%s\n",
+					    "too many softdeps for modname=%s\n",
 					    modname);
 					return -EINVAL;
 				}
-			} else if (mode == S_POST) {
-				buflen += plen + 1;
-				if (uadd32_overflow(n_post, 1, &n_post)) {
-					ERR(config->ctx,
-					    "too many post softdeps for modname=%s\n",
+				if (!strbuf_pushmem(sbuf, p, plen) ||
+				    !strbuf_pushchar(sbuf, '\0')) {
+					ERR(config->ctx, "out-of-memory modname=%s\n",
 					    modname);
-					return -EINVAL;
+					return -ENOMEM;
 				}
 			}
 		}
@@ -301,14 +312,16 @@ static int kmod_config_add_softdep(struct kmod_config *config, const char *modna
 
 	/*
 	 * sizeof(struct kmod_softdep) + modnamelen +
-	 * n_pre * sizeof(const char *) + n_post * sizeof(const char *) + buflen
+	 * n_pre * sizeof(const char *) + n_post * sizeof(const char *) +
+	 * strbuf_used(&sbuf_pre) + strbuf_used(&sbuf_pos)
 	 */
 	if (uaddsz_overflow(sizeof(struct kmod_softdep), modnamelen, &size) ||
 	    umulsz_overflow(n_pre, sizeof(const char *), &size_pre) ||
 	    uaddsz_overflow(size, size_pre, &size) ||
 	    umulsz_overflow(n_post, sizeof(const char *), &size_post) ||
 	    uaddsz_overflow(size, size_post, &size) ||
-	    uaddsz_overflow(size, buflen, &size)) {
+	    uaddsz_overflow(size, strbuf_used(&sbuf_pre), &size) ||
+	    uaddsz_overflow(size, strbuf_used(&sbuf_post), &size)) {
 		ERR(config->ctx, "out-of-memory modname=%s\n", modname);
 		return -ENOMEM;
 	}
@@ -328,54 +341,15 @@ static int kmod_config_add_softdep(struct kmod_config *config, const char *modna
 
 	/* copy strings */
 	itr = dep->name + modnamelen;
-	n_pre = 0;
-	n_post = 0;
-	mode = S_NONE;
-	was_space = false;
-	for (p = s = line;; s++) {
-		size_t plen;
-
-		if (*s != '\0') {
-			if (!isspace(*s)) {
-				was_space = false;
-				continue;
-			}
-
-			if (was_space) {
-				p = s + 1;
-				continue;
-			}
-			was_space = true;
-
-			if (p >= s)
-				continue;
-		}
-		plen = s - p;
-
-		if (plen == sizeof("pre:") - 1 &&
-		    memcmp(p, "pre:", sizeof("pre:") - 1) == 0)
-			mode = S_PRE;
-		else if (plen == sizeof("post:") - 1 &&
-			 memcmp(p, "post:", sizeof("post:") - 1) == 0)
-			mode = S_POST;
-		else if (*s != '\0' || (*s == '\0' && !was_space)) {
-			if (mode == S_PRE) {
-				dep->pre[n_pre] = itr;
-				memcpy(itr, p, plen);
-				itr[plen] = '\0';
-				itr += plen + 1;
-				n_pre++;
-			} else if (mode == S_POST) {
-				dep->post[n_post] = itr;
-				memcpy(itr, p, plen);
-				itr[plen] = '\0';
-				itr += plen + 1;
-				n_post++;
-			}
-		}
-		p = s + 1;
-		if (*s == '\0')
-			break;
+	memcpy(itr, strbuf_str(&sbuf_pre), strbuf_used(&sbuf_pre));
+	for (unsigned int i = 0; i < n_pre; i++) {
+		dep->pre[i] = itr;
+		itr += strlen(itr) + 1;
+	}
+	memcpy(itr, strbuf_str(&sbuf_post), strbuf_used(&sbuf_post));
+	for (unsigned int i = 0; i < n_post; i++) {
+		dep->post[i] = itr;
+		itr += strlen(itr) + 1;
 	}
 
 	list = kmod_list_append(config->softdeps, dep);
@@ -391,18 +365,19 @@ static int kmod_config_add_softdep(struct kmod_config *config, const char *modna
 static int kmod_config_add_weakdep(struct kmod_config *config, const char *modname,
 				   const char *line)
 {
+	DECLARE_STRBUF_WITH_STACK(sbuf, 512);
 	struct kmod_list *list;
 	struct kmod_weakdep *dep;
 	const char *s, *p;
 	char *itr;
 	unsigned int n_weak = 0;
 	size_t modnamelen = strlen(modname) + 1;
-	size_t buflen = 0, size, size_weak;
+	size_t size, size_weak;
 	bool was_space = false;
 
 	DBG(config->ctx, "modname=%s\n", modname);
 
-	/* analyze and count */
+	/* fill string buffer and count */
 	for (p = s = line;; s++) {
 		size_t plen;
 
@@ -424,11 +399,15 @@ static int kmod_config_add_weakdep(struct kmod_config *config, const char *modna
 		plen = s - p;
 
 		if (*s != '\0' || (*s == '\0' && !was_space)) {
-			buflen += plen + 1;
 			if (uadd32_overflow(n_weak, 1, &n_weak)) {
 				ERR(config->ctx, "too many weakdeps for modname=%s\n",
 				    modname);
 				return -EINVAL;
+			}
+			if (!strbuf_pushmem(&sbuf, p, plen) ||
+			    !strbuf_pushchar(&sbuf, '\0')) {
+				ERR(config->ctx, "out-of-memory modname=%s\n", modname);
+				return -ENOMEM;
 			}
 		}
 		p = s + 1;
@@ -438,11 +417,14 @@ static int kmod_config_add_weakdep(struct kmod_config *config, const char *modna
 
 	DBG(config->ctx, "%u weak\n", n_weak);
 
-	/* sizeof(struct kmod_weakdep) + modnamelen + n_weak * sizeof(const char *) + buflen */
+	/*
+	 * sizeof(struct kmod_weakdep) + modnamelen + n_weak * sizeof(const char *) +
+	 * strbuf_used(&sbuf)
+	 */
 	if (uaddsz_overflow(sizeof(struct kmod_weakdep), modnamelen, &size) ||
 	    umulsz_overflow(n_weak, sizeof(const char *), &size_weak) ||
 	    uaddsz_overflow(size, size_weak, &size) ||
-	    uaddsz_overflow(size, buflen, &size)) {
+	    uaddsz_overflow(size, strbuf_used(&sbuf), &size)) {
 		ERR(config->ctx, "out-of-memory modname=%s\n", modname);
 		return -ENOMEM;
 	}
@@ -460,38 +442,10 @@ static int kmod_config_add_weakdep(struct kmod_config *config, const char *modna
 
 	/* copy strings */
 	itr = dep->name + modnamelen;
-	n_weak = 0;
-	was_space = false;
-	for (p = s = line;; s++) {
-		size_t plen;
-
-		if (*s != '\0') {
-			if (!isspace(*s)) {
-				was_space = false;
-				continue;
-			}
-
-			if (was_space) {
-				p = s + 1;
-				continue;
-			}
-			was_space = true;
-
-			if (p >= s)
-				continue;
-		}
-		plen = s - p;
-
-		if (*s != '\0' || (*s == '\0' && !was_space)) {
-			dep->weak[n_weak] = itr;
-			memcpy(itr, p, plen);
-			itr[plen] = '\0';
-			itr += plen + 1;
-			n_weak++;
-		}
-		p = s + 1;
-		if (*s == '\0')
-			break;
+	memcpy(itr, strbuf_str(&sbuf), strbuf_used(&sbuf));
+	for (unsigned int i = 0; i < n_weak; i++) {
+		dep->weak[i] = itr;
+		itr += strlen(itr) + 1;
 	}
 
 	list = kmod_list_append(config->weakdeps, dep);
@@ -506,105 +460,42 @@ static int kmod_config_add_weakdep(struct kmod_config *config, const char *modna
 
 static char *softdep_to_char(struct kmod_softdep *dep)
 {
-	const size_t sz_preprefix = sizeof("pre: ") - 1;
-	const size_t sz_postprefix = sizeof("post: ") - 1;
-	size_t sz = 1; /* at least '\0' */
-	size_t sz_pre, sz_post;
-	const char *start, *end;
-	char *s, *itr;
+	DECLARE_STRBUF(sbuf);
 
-	/*
-	 * Rely on the fact that dep->pre[] and dep->post[] are strv's that
-	 * point to a contiguous buffer
-	 */
 	if (dep->n_pre > 0) {
-		start = dep->pre[0];
-		end = dep->pre[dep->n_pre - 1] + strlen(dep->pre[dep->n_pre - 1]);
-		sz_pre = end - start;
-		sz += sz_pre + sz_preprefix;
-	} else
-		sz_pre = 0;
+		if (!strbuf_pushchars(&sbuf, "pre:"))
+			return NULL;
+		for (unsigned int i = 0; i < dep->n_pre; i++) {
+			if (!strbuf_pushchar(&sbuf, ' ') ||
+			    !strbuf_pushchars(&sbuf, dep->pre[i]))
+				return NULL;
+		}
+	}
 
 	if (dep->n_post > 0) {
-		start = dep->post[0];
-		end = dep->post[dep->n_post - 1] + strlen(dep->post[dep->n_post - 1]);
-		sz_post = end - start;
-		sz += sz_post + sz_postprefix;
-	} else
-		sz_post = 0;
-
-	itr = s = malloc(sz);
-	if (s == NULL)
-		return NULL;
-
-	if (sz_pre) {
-		char *p;
-
-		memcpy(itr, "pre: ", sz_preprefix);
-		itr += sz_preprefix;
-
-		/* include last '\0' */
-		memcpy(itr, dep->pre[0], sz_pre + 1);
-		for (p = itr; p < itr + sz_pre; p++) {
-			if (*p == '\0')
-				*p = ' ';
+		if (!strbuf_pushchars(&sbuf, "post:"))
+			return NULL;
+		for (unsigned int i = 0; i < dep->n_post; i++) {
+			if (!strbuf_pushchar(&sbuf, ' ') ||
+			    !strbuf_pushchars(&sbuf, dep->post[i]))
+				return NULL;
 		}
-		itr = p;
 	}
 
-	if (sz_post) {
-		char *p;
-
-		memcpy(itr, "post: ", sz_postprefix);
-		itr += sz_postprefix;
-
-		/* include last '\0' */
-		memcpy(itr, dep->post[0], sz_post + 1);
-		for (p = itr; p < itr + sz_post; p++) {
-			if (*p == '\0')
-				*p = ' ';
-		}
-		itr = p;
-	}
-
-	*itr = '\0';
-
-	return s;
+	return strbuf_steal(&sbuf);
 }
 
 static char *weakdep_to_char(struct kmod_weakdep *dep)
 {
-	size_t sz;
-	const char *start, *end;
-	char *s, *itr;
+	DECLARE_STRBUF(sbuf);
 
-	/* Rely on the fact that dep->weak[] is a strv that points to a contiguous buffer */
-	if (dep->n_weak > 0) {
-		start = dep->weak[0];
-		end = dep->weak[dep->n_weak - 1] + strlen(dep->weak[dep->n_weak - 1]) + 1;
-		sz = end - start;
-	} else
-		sz = 0;
-
-	itr = s = malloc(sz);
-	if (s == NULL)
-		return NULL;
-
-	if (sz) {
-		char *p;
-
-		/* include last '\0' */
-		memcpy(itr, dep->weak[0], sz);
-		for (p = itr; p < itr + sz - 1; p++) {
-			if (*p == '\0')
-				*p = ' ';
-		}
-		itr = p;
+	for (unsigned int i = 0; i < dep->n_weak; i++) {
+		if ((strbuf_used(&sbuf) != 0 && !strbuf_pushchar(&sbuf, ' ')) ||
+		    !strbuf_pushchars(&sbuf, dep->weak[i]))
+			return NULL;
 	}
 
-	*itr = '\0';
-
-	return s;
+	return strbuf_steal(&sbuf);
 }
 
 static void kcmdline_parse_result(struct kmod_config *config, char *modname, char *param,
