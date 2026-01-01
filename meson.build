@@ -327,6 +327,14 @@ config_h = configure_file(
   configuration : cdata
 )
 
+# ------------------------------------------------------------------
+# experimental 390 workaround
+# ------------------------------------------------------------------
+
+if get_option('s390')
+  add_project_arguments('-DS390_WORKAROUND=1', language: 'c')
+endif
+
 add_project_arguments('-include', 'config.h', language : 'c')
 
 ################################################################################
@@ -568,6 +576,7 @@ summary({
   'manpages'        : get_option('manpages'),
   'docs'            : get_option('docs'),
   'dlopen'          : get_option('dlopen'),
+  's390'            : get_option('s390'),
 }, section : 'Options')
 
 summary({
@@ -578,3 +587,15 @@ summary({
   'Compiler'        : cc.get_id() + ' (' + cc.version() + ')',
   'Linker'          : cc.get_linker_id(),
 }, section : 'Build tools')
+
+summary({
+  'int'                 : cc.sizeof('int'),
+  'long'                : cc.sizeof('long'),
+  'size_t'              : cc.sizeof('size_t'),
+  'size_t *'            : cc.sizeof('size_t *'),
+  'unsigned int'        : cc.sizeof('unsigned int'),
+  'unsigned int *'      : cc.sizeof('unsigned int *'),
+  'long unsigned int'   : cc.sizeof('long unsigned int'),
+  'long unsigned int *' : cc.sizeof('long unsigned int *'),
+  'void *'              : cc.sizeof('void *'),
+}, section : 'Sizes of Data Types')

@@ -112,3 +112,10 @@ option(
   value : false,
   description : 'Build the documentation. Default: false',
 )
+
+option(
+  's390',
+  type : 'boolean',
+  value : false,
+  description : 'Workaround for s390. Default: false',
+)
