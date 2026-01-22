@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <getopt.h>
 #include <limits.h>
+#include <pthread.h>
 #include <regex.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1588,14 +1589,40 @@ static struct symbol *depmod_symbol_find(const struct depmod *depmod, const char
 	return hash_find(depmod->symbols, name);
 }
 
-static int depmod_load_modules(struct depmod *depmod)
+static unsigned int get_cpu_count(void)
 {
+	long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+	if (nproc <= 0)
+		return 1;
+	return (unsigned int)nproc;
+}
+
+struct batched_symbol {
+	char *name; /* strdup'd, must be freed */
+	uint64_t crc;
+	const struct mod *owner;
+	bool prefix_skipped;
+};
+
+struct load_modules_work {
+	struct depmod *depmod;
+	struct mod **modules;
+	size_t start;
+	size_t end;
+	int err;
+	struct array symbol_batch; /* struct batched_symbol */
+};
+
+static void *load_modules_worker(void *arg)
+{
+	struct load_modules_work *work = arg;
 	struct mod **itr, **itr_end;
 
-	DBG("load symbols (%zu modules)\n", depmod->modules.count);
+	itr = work->modules + work->start;
+	itr_end = work->modules + work->end;
 
-	itr = (struct mod **)depmod->modules.array;
-	itr_end = itr + depmod->modules.count;
+	array_init(&work->symbol_batch, 128);
+
 	for (; itr < itr_end; itr++) {
 		struct mod *mod = *itr;
 		struct kmod_list *l, *list = NULL;
@@ -1611,7 +1638,36 @@ static int depmod_load_modules(struct depmod *depmod)
 		kmod_list_foreach(l, list) {
 			const char *name = kmod_module_symbol_get_symbol(l);
 			uint64_t crc = kmod_module_symbol_get_crc(l);
-			depmod_symbol_add(depmod, name, false, crc, mod);
+			struct batched_symbol *bsym;
+			int idx;
+
+			/* Allocate and batch symbol for later addition */
+			bsym = malloc(sizeof(struct batched_symbol));
+			if (bsym == NULL) {
+				work->err = -ENOMEM;
+				kmod_module_symbols_free_list(list);
+				return NULL;
+			}
+			/* Copy the name since it will be invalid after freeing the list */
+			bsym->name = strdup(name);
+			if (bsym->name == NULL) {
+				free(bsym);
+				work->err = -ENOMEM;
+				kmod_module_symbols_free_list(list);
+				return NULL;
+			}
+			bsym->crc = crc;
+			bsym->owner = mod;
+			bsym->prefix_skipped = false;
+
+			idx = array_append(&work->symbol_batch, bsym);
+			if (idx < 0) {
+				free(bsym->name);
+				free(bsym);
+				work->err = idx;
+				kmod_module_symbols_free_list(list);
+				return NULL;
+			}
 		}
 		kmod_module_symbols_free_list(list);
 
@@ -1623,22 +1679,28 @@ load_info:
 			if (streq(key, "alias")) {
 				const char *value = kmod_module_info_get_value(l);
 
-				if (array_append(&mod->alias_values, value) < 0)
-					return 0;
+				if (array_append(&mod->alias_values, value) < 0) {
+					work->err = -ENOMEM;
+					return NULL;
+				}
 				continue;
 			}
 			if (streq(key, "softdep")) {
 				const char *value = kmod_module_info_get_value(l);
 
-				if (array_append(&mod->softdep_values, value) < 0)
-					return 0;
+				if (array_append(&mod->softdep_values, value) < 0) {
+					work->err = -ENOMEM;
+					return NULL;
+				}
 				continue;
 			}
 			if (streq(key, "weakdep")) {
 				const char *value = kmod_module_info_get_value(l);
 
-				if (array_append(&mod->weakdep_values, value) < 0)
-					return 0;
+				if (array_append(&mod->weakdep_values, value) < 0) {
+					work->err = -ENOMEM;
+					return NULL;
+				}
 				continue;
 			}
 		}
@@ -1647,10 +1709,124 @@ load_info:
 		mod->kmod = NULL;
 	}
 
+	return NULL;
+}
+
+static int depmod_load_modules(struct depmod *depmod)
+{
+	unsigned int n_threads;
+	pthread_t *threads;
+	struct load_modules_work *work;
+	size_t modules_per_thread;
+	size_t i;
+	int err = 0;
+
+	DBG("load symbols (%zu modules)\n", depmod->modules.count);
+
+	if (depmod->modules.count == 0)
+		return 0;
+
+	n_threads = get_cpu_count();
+	if (n_threads > depmod->modules.count)
+		n_threads = depmod->modules.count;
+
+	threads = calloc(n_threads, sizeof(pthread_t));
+	if (threads == NULL)
+		return -ENOMEM;
+
+	work = calloc(n_threads, sizeof(struct load_modules_work));
+	if (work == NULL) {
+		free(threads);
+		return -ENOMEM;
+	}
+
+	modules_per_thread = (depmod->modules.count + n_threads - 1) / n_threads;
+
+	for (i = 0; i < n_threads; i++) {
+		work[i].depmod = depmod;
+		work[i].modules = (struct mod **)depmod->modules.array;
+		work[i].start = i * modules_per_thread;
+		work[i].end = work[i].start + modules_per_thread;
+		if (work[i].end > depmod->modules.count)
+			work[i].end = depmod->modules.count;
+		work[i].err = 0;
+
+		if (pthread_create(&threads[i], NULL, load_modules_worker, &work[i]) != 0) {
+			err = -errno;
+			/* Wait for already started threads */
+			for (size_t j = 0; j < i; j++) {
+				pthread_join(threads[j], NULL);
+				/* Free batched symbols */
+				for (size_t k = 0; k < work[j].symbol_batch.count; k++) {
+					struct batched_symbol *bsym = work[j].symbol_batch.array[k];
+					free(bsym->name);
+					free(bsym);
+				}
+				array_free_array(&work[j].symbol_batch);
+			}
+			free(work);
+			free(threads);
+			return err;
+		}
+	}
+
+	for (i = 0; i < n_threads; i++) {
+		pthread_join(threads[i], NULL);
+		if (work[i].err < 0 && err == 0)
+			err = work[i].err;
+	}
+
+	/* Merge all batched symbols in a single critical section */
+	if (err == 0) {
+		for (i = 0; i < n_threads; i++) {
+			for (size_t j = 0; j < work[i].symbol_batch.count; j++) {
+				struct batched_symbol *bsym = work[i].symbol_batch.array[j];
+				int add_err = depmod_symbol_add(depmod, bsym->name, bsym->prefix_skipped,
+									bsym->crc, bsym->owner);
+				free(bsym->name);
+				free(bsym);
+				if (add_err < 0) {
+					err = add_err;
+					/* Continue freeing remaining symbols from this thread */
+					for (size_t k = j + 1; k < work[i].symbol_batch.count; k++) {
+						bsym = work[i].symbol_batch.array[k];
+						free(bsym->name);
+						free(bsym);
+					}
+					/* Free remaining symbols from other threads */
+					for (size_t k = i + 1; k < n_threads; k++) {
+						for (size_t l = 0; l < work[k].symbol_batch.count; l++) {
+							bsym = work[k].symbol_batch.array[l];
+							free(bsym->name);
+							free(bsym);
+						}
+					}
+					break;
+				}
+			}
+			if (err < 0)
+				break;
+		}
+	} else {
+		/* Free batched symbols on error */
+		for (i = 0; i < n_threads; i++) {
+			for (size_t j = 0; j < work[i].symbol_batch.count; j++) {
+				struct batched_symbol *bsym = work[i].symbol_batch.array[j];
+				free(bsym->name);
+				free(bsym);
+			}
+		}
+	}
+
+	for (i = 0; i < n_threads; i++)
+		array_free_array(&work[i].symbol_batch);
+	free(work);
+	free(threads);
+
 	DBG("loaded symbols (%zu modules, %u symbols)\n", depmod->modules.count,
 	    hash_get_count(depmod->symbols));
 
-	return 0;
+	return err;
 }
 
 static int depmod_load_module_dependencies(struct depmod *depmod, struct mod *mod)
